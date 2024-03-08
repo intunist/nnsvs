@@ -3,9 +3,12 @@ requires = [
     "wheel",
     "setuptools",
     "cython>=0.28.0",
-    "numpy<v1.21.2",
     "scipy",
+    "cmake",
+    "numpy>=1.25.0; python_version>='3.9'",
+    "oldest-supported-numpy; python_version<'3.9'",
 ]
+build-backend = "setuptools.build_meta"
 
 
 [tool.pysen]
