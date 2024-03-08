@@ -117,32 +117,15 @@ if [ ${stage} -le 99 ] && [ ${stop_stage} -ge 99 ]; then
         feature_type="world"
     fi
 
-    # Find settings needed for inference
-    local_config_path=conf/prepare_features/acoustic/${acoustic_features}.yaml
-    global_config_path=$NNSVS_ROOT/nnsvs/bin/conf/prepare_features/acoustic/${acoustic_features}.yaml
-    if [ -e $local_config_path ]; then
-        relative_f0=$(grep relative_f0 $local_config_path | awk '{print $2}')
-        subphone_features=$(grep subphone_features $local_config_path | awk '{print $2}')
-        use_world_codec=$(grep use_world_codec $local_config_path | awk '{print $2}')
-        frame_period=$(grep frame_period $local_config_path | awk '{print $2}')
-    elif [ -e $global_config_path ]; then
-        relative_f0=$(grep relative_f0 $global_config_path | awk '{print $2}')
-        subphone_features=$(grep subphone_features $global_config_path | awk '{print $2}')
-        use_world_codec=$(grep use_world_codec $global_config_path | awk '{print $2}')
-        frame_period=$(grep frame_period $global_config_path | awk '{print $2}')
-    else
-        echo "config file not found: $local_config_path or $global_config_path"
-        exit 1
-    fi
-
     mkdir -p $dst_dir
     # global config file
+    # NOTE: New residual F0 prediction models require relative_f0 to be false.
     cat > ${dst_dir}/config.yaml <<EOL
 # Global configs
 sample_rate: ${sample_rate}
-frame_period: ${frame_period}
+frame_period: 5
 log_f0_conditioning: true
-use_world_codec: ${use_world_codec}
+use_world_codec: true
 feature_type: ${feature_type}
 
 # Model-specific synthesis configs
@@ -153,9 +136,10 @@ timelag:
 duration:
     force_clip_input_features: true
 acoustic:
-    subphone_features: ${subphone_features}
+    subphone_features: "coarse_coding"
     force_clip_input_features: true
-    relative_f0: ${relative_f0}
+    relative_f0: false
+    post_filter: true
 EOL
 
     . $NNSVS_COMMON_ROOT/pack_model.sh

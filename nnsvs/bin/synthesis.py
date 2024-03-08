@@ -1,5 +1,6 @@
 import os
 from os.path import join
+from pathlib import Path
 
 import hydra
 import joblib
@@ -7,18 +8,41 @@ import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 from nnmnkwii.io import hts
-from nnsvs.gen import (
-    postprocess_acoustic,
-    postprocess_waveform,
-    predict_acoustic,
-    predict_timing,
-    predict_waveform,
-)
 from nnsvs.logger import getLogger
-from nnsvs.util import extract_static_scaler, init_seed, load_utt_list, load_vocoder
+from nnsvs.multistream import get_static_features, get_static_stream_sizes
+from nnsvs.svs import post_process, predict_timings, synthesis_from_timings
+from nnsvs.usfgan import USFGANWrapper
+from nnsvs.util import StandardScaler, init_seed, load_utt_list
 from omegaconf import DictConfig, OmegaConf
+from parallel_wavegan.utils import load_model
 from scipy.io import wavfile
 from tqdm.auto import tqdm
+
+
+def extract_static_scaler(out_scaler, model_config):
+    mean_ = get_static_features(
+        out_scaler.mean_.reshape(1, 1, out_scaler.mean_.shape[-1]),
+        model_config.num_windows,
+        model_config.stream_sizes,
+        model_config.has_dynamic_features,
+    )
+    mean_ = np.concatenate(mean_, -1).reshape(1, -1)
+    var_ = get_static_features(
+        out_scaler.var_.reshape(1, 1, out_scaler.var_.shape[-1]),
+        model_config.num_windows,
+        model_config.stream_sizes,
+        model_config.has_dynamic_features,
+    )
+    var_ = np.concatenate(var_, -1).reshape(1, -1)
+    scale_ = get_static_features(
+        out_scaler.scale_.reshape(1, 1, out_scaler.scale_.shape[-1]),
+        model_config.num_windows,
+        model_config.stream_sizes,
+        model_config.has_dynamic_features,
+    )
+    scale_ = np.concatenate(scale_, -1).reshape(1, -1)
+    static_scaler = StandardScaler(mean_, var_, scale_)
+    return static_scaler
 
 
 @hydra.main(config_path="conf/synthesis", config_name="config")
@@ -75,13 +99,74 @@ def my_app(config: DictConfig) -> None:
 
     # Vocoder
     if config.vocoder.checkpoint is not None and len(config.vocoder.checkpoint) > 0:
-        vocoder, vocoder_in_scaler, vocoder_config = load_vocoder(
-            to_absolute_path(config.vocoder.checkpoint),
-            device,
-            acoustic_config,
-        )
+        path = Path(to_absolute_path(config.vocoder.checkpoint))
+        vocoder_dir = path.parent
+        if (vocoder_dir / "vocoder_model.yaml").exists():
+            # packed model
+            vocoder_config = OmegaConf.load(vocoder_dir / "vocoder_model.yaml")
+        elif (vocoder_dir / "config.yml").exists():
+            # PWG checkpoint
+            vocoder_config = OmegaConf.load(vocoder_dir / "config.yml")
+        else:
+            # usfgan
+            vocoder_config = OmegaConf.load(vocoder_dir / "config.yaml")
+
+        if "generator" in vocoder_config and "discriminator" in vocoder_config:
+            # usfgan
+            checkpoint = torch.load(
+                path,
+                map_location=lambda storage, loc: storage,
+            )
+            vocoder = hydra.utils.instantiate(vocoder_config.generator).to(device)
+            vocoder.load_state_dict(checkpoint["model"]["generator"])
+            vocoder.remove_weight_norm()
+            vocoder = USFGANWrapper(vocoder_config, vocoder)
+
+            # Extract scaler params for [mgc, bap]
+            if vocoder_config.data.aux_feats == ["mcep", "codeap"]:
+                mean_ = np.load(vocoder_dir / "in_vocoder_scaler_mean.npy")
+                var_ = np.load(vocoder_dir / "in_vocoder_scaler_var.npy")
+                scale_ = np.load(vocoder_dir / "in_vocoder_scaler_scale.npy")
+                stream_sizes = get_static_stream_sizes(
+                    acoustic_config.stream_sizes,
+                    acoustic_config.has_dynamic_features,
+                    acoustic_config.num_windows,
+                )
+                mgc_end_dim = stream_sizes[0]
+                bap_start_dim = sum(stream_sizes[:3])
+                bap_end_dim = sum(stream_sizes[:4])
+                vocoder_in_scaler = StandardScaler(
+                    np.concatenate(
+                        [mean_[:mgc_end_dim], mean_[bap_start_dim:bap_end_dim]]
+                    ),
+                    np.concatenate(
+                        [var_[:mgc_end_dim], var_[bap_start_dim:bap_end_dim]]
+                    ),
+                    np.concatenate(
+                        [scale_[:mgc_end_dim], scale_[bap_start_dim:bap_end_dim]]
+                    ),
+                )
+            else:
+                vocoder_in_scaler = StandardScaler(
+                    np.load(vocoder_dir / "in_vocoder_scaler_mean.npy")[:80],
+                    np.load(vocoder_dir / "in_vocoder_scaler_var.npy")[:80],
+                    np.load(vocoder_dir / "in_vocoder_scaler_scale.npy")[:80],
+                )
+        else:
+            # Normal pwg
+            vocoder = load_model(path, config=vocoder_config).to(device)
+            vocoder.remove_weight_norm()
+            vocoder_in_scaler = StandardScaler(
+                np.load(vocoder_dir / "in_vocoder_scaler_mean.npy"),
+                np.load(vocoder_dir / "in_vocoder_scaler_var.npy"),
+                np.load(vocoder_dir / "in_vocoder_scaler_scale.npy"),
+            )
+
+        vocoder.eval()
     else:
-        vocoder, vocoder_in_scaler, vocoder_config = None, None, None
+        vocoder = None
+        vocoder_config = None
+        vocoder_in_scaler = None
         if config.synthesis.vocoder_type != "world":
             logger.warning("Vocoder checkpoint is not specified")
             logger.info(f"Use world instead of {config.synthesis.vocoder_type}.")
@@ -106,7 +191,7 @@ def my_app(config: DictConfig) -> None:
         if config.synthesis.ground_truth_duration:
             duration_modified_labels = labels
         else:
-            duration_modified_labels = predict_timing(
+            duration_modified_labels = predict_timings(
                 device=device,
                 labels=labels,
                 binary_dict=binary_dict,
@@ -126,72 +211,39 @@ def my_app(config: DictConfig) -> None:
                 frame_period=config.synthesis.frame_period,
             )
 
-        # Predict acoustic features
-        acoustic_features = predict_acoustic(
+        wav, _ = synthesis_from_timings(
             device=device,
-            labels=duration_modified_labels,
+            duration_modified_labels=duration_modified_labels,
+            binary_dict=binary_dict,
+            numeric_dict=numeric_dict,
             acoustic_model=acoustic_model,
             acoustic_config=acoustic_config,
             acoustic_in_scaler=acoustic_in_scaler,
             acoustic_out_scaler=acoustic_out_scaler,
-            binary_dict=binary_dict,
-            numeric_dict=numeric_dict,
-            subphone_features=config.synthesis.subphone_features,
-            log_f0_conditioning=config.synthesis.log_f0_conditioning,
-            force_clip_input_features=config.acoustic.force_clip_input_features,
-            f0_shift_in_cent=config.synthesis.pre_f0_shift_in_cent,
-        )
-
-        # NOTE: the output of this function is tuple of features
-        # e.g., (mgc, lf0, vuv, bap)
-        multistream_features = postprocess_acoustic(
-            device=device,
-            acoustic_features=acoustic_features,
-            duration_modified_labels=duration_modified_labels,
-            binary_dict=binary_dict,
-            numeric_dict=numeric_dict,
-            acoustic_config=acoustic_config,
             acoustic_out_static_scaler=acoustic_out_static_scaler,
-            postfilter_model=None,  # NOTE: learned post-filter is not supported
-            postfilter_config=None,
-            postfilter_out_scaler=None,
-            sample_rate=config.synthesis.sample_rate,
-            frame_period=config.synthesis.frame_period,
-            relative_f0=config.synthesis.relative_f0,
-            feature_type=config.synthesis.feature_type,
-            post_filter_type=config.synthesis.post_filter_type,
-            trajectory_smoothing=config.synthesis.trajectory_smoothing,
-            trajectory_smoothing_cutoff=config.synthesis.trajectory_smoothing_cutoff,
-            trajectory_smoothing_cutoff_f0=config.synthesis.trajectory_smoothing_cutoff_f0,
-            vuv_threshold=config.synthesis.vuv_threshold,
-            f0_shift_in_cent=config.synthesis.post_f0_shift_in_cent,
-            vibrato_scale=1.0,
-            force_fix_vuv=config.synthesis.force_fix_vuv,
-        )
-
-        # Generate waveform by vocoder
-        wav = predict_waveform(
-            device=device,
-            multistream_features=multistream_features,
             vocoder=vocoder,
             vocoder_config=vocoder_config,
             vocoder_in_scaler=vocoder_in_scaler,
             sample_rate=config.synthesis.sample_rate,
             frame_period=config.synthesis.frame_period,
+            log_f0_conditioning=config.synthesis.log_f0_conditioning,
+            subphone_features=config.synthesis.subphone_features,
             use_world_codec=config.synthesis.use_world_codec,
+            force_clip_input_features=config.acoustic.force_clip_input_features,
+            relative_f0=config.synthesis.relative_f0,
             feature_type=config.synthesis.feature_type,
             vocoder_type=config.synthesis.vocoder_type,
+            post_filter_type=config.synthesis.post_filter_type,
+            trajectory_smoothing=config.synthesis.trajectory_smoothing,
+            trajectory_smoothing_cutoff=config.synthesis.trajectory_smoothing_cutoff,
+            trajectory_smoothing_cutoff_f0=config.synthesis.trajectory_smoothing_cutoff_f0,
             vuv_threshold=config.synthesis.vuv_threshold,
+            pre_f0_shift_in_cent=config.synthesis.pre_f0_shift_in_cent,
+            post_f0_shift_in_cent=config.synthesis.post_f0_shift_in_cent,
+            vibrato_scale=config.synthesis.vibrato_scale,
+            force_fix_vuv=config.synthesis.force_fix_vuv,
         )
-
-        wav = postprocess_waveform(
-            wav=wav,
-            sample_rate=config.synthesis.sample_rate,
-            dtype=np.int16,
-            peak_norm=False,
-            loudness_norm=False,
-        )
-
+        wav = post_process(wav, config.synthesis.sample_rate)
         out_wav_path = join(out_dir, f"{utt_id}.wav")
         wavfile.write(
             out_wav_path, rate=config.synthesis.sample_rate, data=wav.astype(np.int16)

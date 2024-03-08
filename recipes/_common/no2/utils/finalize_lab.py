@@ -225,7 +225,7 @@ for base in tqdm(base_files):
     utt_id = splitext(basename(base))[0]
 
     _wav_path = glob(
-        join(expanduser(config["db_root"]), join("**", f"{utt_id}.wav")), recursive=True
+        join(expanduser(config["db_root"]), f"**/{utt_id}.wav"), recursive=True
     )
     if _wav_path is None:
         sys.exit(f"{utt_id} is not found.")
@@ -233,7 +233,11 @@ for base in tqdm(base_files):
         print(f"Multiple {utt_id} is found, so {_wav_path[0]} is used.")
     wav_path = _wav_path[0]
 
-    wav, sr = librosa.load(wav_path, sr=None)
+    wav, sr = librosa.load(wav_path, sr=config["sample_rate"])
+    assert sr == config["sample_rate"]
+
+    # gain normalize
+    wav = wav / wav.max() * 0.99
 
     seg_idx = 0
     while True:

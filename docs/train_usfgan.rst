@@ -1,5 +1,5 @@
-How to train uSFGAN/SiFiGAN vocoders
-====================================
+How to train uSFGAN vocoders
+============================
 
 Please check :doc:`recipes` and :doc:`overview` first.
 

@@ -27,7 +27,7 @@ setup(
         "cython",
         "torch >= 1.6.0",
         "torchaudio",
-        "hydra-core >= 1.1.0",
+        "hydra-core >= 1.1.0, < 1.2.0",
         "hydra_colorlog >= 1.1.0",
         "librosa >= 0.7.0",
         "pysptk",
@@ -35,13 +35,10 @@ setup(
         "tensorboard",
         "nnmnkwii",
         "pysinsy",
-        "pyloudnorm",
     ],
     extras_require={
         "dev": [
-            # NOTE: tentative fix for https://github.com/nnsvs/nnsvs/issues/191
-            "matplotlib<3.6.0",
-            "seaborn",
+            "matplotlib",
             "mlflow",
             "optuna",
             "hydra-optuna-sweeper",
@@ -70,7 +67,6 @@ setup(
             "flake8-bugbear",
             "isort>=4.3,<5.2.0",
             "click<8.1.0",
-            "importlib-metadata<5.0",
         ],
         "test": ["pytest"],
     },

@@ -111,7 +111,5 @@ out_lf0_scale: {lf0_params["scale"]}
 NOTE: If you are using the same data for training acoustic/vocoder models, the F0 statistics
 for those models should be the same. If you are using different data for training
 acoustic/vocoder models (e.g., training a vocoder model on a multiple DBs),
-you will likely need to set different F0 statistics for acoustic/vocoder models.
-
-If you use uSFGAN/SiFI-GAN, it is not necessary to manually set the F0 statistics."""
+you will likely need to set different F0 statistics for acoustic/vocoder models."""
     )

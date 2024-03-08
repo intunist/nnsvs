@@ -14,7 +14,6 @@ from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 __all__ = [
-    "ExtractFromInput",
     "FFN",
     "LSTMRNN",
     "LSTMRNNSAR",
@@ -29,28 +28,6 @@ __all__ = [
     "VariancePredictor",
     "TransformerEncoder",
 ]
-
-
-class ExtractFromInput(BaseModel):
-    """Extract a part of input
-
-    This class doesn't have any learnable parameters.
-
-    Args:
-        start_idx (int): the start index of the input
-        end_idx (int): the end index of the input
-
-    """
-
-    def __init__(self, start_idx, end_idx):
-        super().__init__()
-        self.start_idx = start_idx
-        self.end_idx = end_idx
-
-    def forward(self, x, lengths=None, y=None):
-        """Forward pass"""
-        # x: (B, T, C)
-        return x[:, :, self.start_idx : self.end_idx]
 
 
 class Conv1dResnet(BaseModel):
@@ -68,9 +45,6 @@ class Conv1dResnet(BaseModel):
         use_mdn (bool): whether to use MDN or not
         num_gaussians (int): the number of gaussians in MDN
         dim_wise (bool): whether to use dim-wise or not
-        in_ph_start_idx (int): the start index of phoneme identity in a hed file
-        in_ph_end_idx (int): the end index of phoneme identity in a hed file
-        embed_dim (int): the dimension of the phoneme embedding
     """
 
     def __init__(
@@ -83,19 +57,10 @@ class Conv1dResnet(BaseModel):
         use_mdn=False,
         num_gaussians=8,
         dim_wise=False,
-        in_ph_start_idx: int = 1,
-        in_ph_end_idx: int = 50,
-        embed_dim=None,
         **kwargs,
     ):
         super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
         self.use_mdn = use_mdn
-        self.in_ph_start_idx = in_ph_start_idx
-        self.in_ph_end_idx = in_ph_end_idx
-        self.num_vocab = in_ph_end_idx - in_ph_start_idx
-        self.embed_dim = embed_dim
 
         if "dropout" in kwargs:
             warn(
@@ -103,17 +68,9 @@ class Conv1dResnet(BaseModel):
                 " and will be removed in future versions"
             )
 
-        if self.embed_dim is not None:
-            assert in_dim > self.num_vocab
-            self.emb = nn.Embedding(self.num_vocab, embed_dim)
-            self.fc_in = nn.Linear(in_dim - self.num_vocab, embed_dim)
-            conv_in_dim = embed_dim
-        else:
-            conv_in_dim = in_dim
-
         model = [
             nn.ReflectionPad1d(3),
-            WNConv1d(conv_in_dim, hidden_dim, kernel_size=7, padding=0),
+            WNConv1d(in_dim, hidden_dim, kernel_size=7, padding=0),
         ]
         for n in range(num_layers):
             model.append(ResnetBlock(hidden_dim, dilation=2 ** n))
@@ -157,22 +114,6 @@ class Conv1dResnet(BaseModel):
         Returns:
             torch.Tensor: the output tensor
         """
-
-        if self.embed_dim is not None:
-            x_first, x_ph_onehot, x_last = torch.split(
-                x,
-                [
-                    self.in_ph_start_idx,
-                    self.num_vocab,
-                    self.in_dim - self.num_vocab - self.in_ph_start_idx,
-                ],
-                dim=-1,
-            )
-            x_ph = torch.argmax(x_ph_onehot, dim=-1)
-            # Make sure to have one-hot vector
-            assert (x_ph_onehot.sum(-1) <= 1).all()
-            x = self.emb(x_ph) + self.fc_in(torch.cat([x_first, x_last], dim=-1))
-
         out = self.model(x.transpose(1, 2)).transpose(1, 2)
 
         if self.use_mdn:
@@ -702,7 +643,12 @@ class MDNv2(BaseModel):
 
 
 class Conv1dResnetMDN(BaseModel):
-    """Conv1dResnet with MDN output layer"""
+    """Conv1dResnet with MDN output layer
+
+    .. warning::
+
+        Will be removed in v0.1.0. Use Conv1dResNet with ``use_mdn=True`` instead.
+    """
 
     def __init__(
         self,
@@ -718,7 +664,10 @@ class Conv1dResnetMDN(BaseModel):
         super().__init__()
 
         if "dropout" in kwargs:
-            warn("dropout argument in Conv1dResnet is deprecated")
+            warn(
+                "dropout argument in Conv1dResnet is deprecated"
+                " and will be removed in future versions"
+            )
 
         model = [
             Conv1dResnet(
@@ -811,7 +760,6 @@ class FFConvLSTM(BaseModel):
         in_ph_start_idx: int = 1,
         in_ph_end_idx: int = 50,
         embed_dim=None,
-        enforce_sorted=True,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -821,7 +769,6 @@ class FFConvLSTM(BaseModel):
         self.num_vocab = in_ph_end_idx - in_ph_start_idx
         self.embed_dim = embed_dim
         self.use_mdn = use_mdn
-        self.enforce_sorted = enforce_sorted
 
         if self.embed_dim is not None:
             assert in_dim > self.num_vocab
@@ -906,11 +853,9 @@ class FFConvLSTM(BaseModel):
 
         out = self.ff(x)
         out = self.conv(out.transpose(1, 2)).transpose(1, 2)
-        sequence = pack_padded_sequence(
-            out, lengths, batch_first=True, enforce_sorted=self.enforce_sorted
-        )
+        sequence = pack_padded_sequence(out, lengths, batch_first=True)
         out, _ = self.lstm(sequence)
-        out, _ = pad_packed_sequence(out, batch_first=True, total_length=x.size(1))
+        out, _ = pad_packed_sequence(out, batch_first=True)
 
         return self.fc(out)
 
@@ -940,11 +885,6 @@ class VariancePredictor(BaseModel):
         use_mdn (bool): whether to use MDN or not
         num_gaussians (int): the number of gaussians
         dim_wise (bool): whether to use dim-wise or not
-        in_ph_start_idx (int): the start index of phoneme identity in a hed file
-        in_ph_end_idx (int): the end index of phoneme identity in a hed file
-        embed_dim (int): the dimension of the phoneme embedding
-        mask_indices (list): the input feature indices to be masked.
-            e.g., specify pitch_idx to mask pitch features.
     """
 
     def __init__(
@@ -959,27 +899,9 @@ class VariancePredictor(BaseModel):
         use_mdn=False,
         num_gaussians=1,
         dim_wise=False,
-        in_ph_start_idx: int = 1,
-        in_ph_end_idx: int = 50,
-        embed_dim=None,
-        mask_indices=None,
     ):
         super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
         self.use_mdn = use_mdn
-        self.in_ph_start_idx = in_ph_start_idx
-        self.in_ph_end_idx = in_ph_end_idx
-        self.num_vocab = in_ph_end_idx - in_ph_start_idx
-        self.embed_dim = embed_dim
-        self.use_mdn = use_mdn
-        self.mask_indices = mask_indices
-
-        if self.embed_dim is not None:
-            assert in_dim > self.num_vocab
-            self.emb = nn.Embedding(self.num_vocab, embed_dim)
-            self.fc_in = nn.Linear(in_dim - self.num_vocab, embed_dim)
-            in_dim = embed_dim
 
         conv = nn.ModuleList()
         for idx in range(num_layers):
@@ -1026,26 +948,6 @@ class VariancePredictor(BaseModel):
         Returns:
             torch.Tensor: the output tensor
         """
-        # Masking specified features
-        if self.mask_indices is not None:
-            for idx in self.mask_indices:
-                x[:, :, idx] *= 0.0
-
-        if self.embed_dim is not None:
-            x_first, x_ph_onehot, x_last = torch.split(
-                x,
-                [
-                    self.in_ph_start_idx,
-                    self.num_vocab,
-                    self.in_dim - self.num_vocab - self.in_ph_start_idx,
-                ],
-                dim=-1,
-            )
-            x_ph = torch.argmax(x_ph_onehot, dim=-1)
-            # Make sure to have one-hot vector
-            assert (x_ph_onehot.sum(-1) <= 1).all()
-            x = self.emb(x_ph) + self.fc_in(torch.cat([x_first, x_last], dim=-1))
-
         out = self.conv(x.transpose(1, 2)).transpose(1, 2)
 
         if self.use_mdn:
@@ -1103,7 +1005,6 @@ class LSTMEncoder(BaseModel):
         in_ph_start_idx: int = 1,
         in_ph_end_idx: int = 50,
         embed_dim=None,
-        enforce_sorted=True,
     ):
         super(LSTMEncoder, self).__init__()
         self.in_dim = in_dim
@@ -1111,7 +1012,6 @@ class LSTMEncoder(BaseModel):
         self.in_ph_end_idx = in_ph_end_idx
         self.num_vocab = in_ph_end_idx - in_ph_start_idx
         self.embed_dim = embed_dim
-        self.enforce_sorted = enforce_sorted
 
         if self.embed_dim is not None:
             assert in_dim > self.num_vocab
@@ -1152,12 +1052,9 @@ class LSTMEncoder(BaseModel):
 
         if isinstance(lengths, torch.Tensor):
             lengths = lengths.to("cpu")
-        total_length = x.size(1)
-        x = pack_padded_sequence(
-            x, lengths, batch_first=True, enforce_sorted=self.enforce_sorted
-        )
+        x = pack_padded_sequence(x, lengths, batch_first=True)
         out, _ = self.lstm(x)
-        out, _ = pad_packed_sequence(out, batch_first=True, total_length=total_length)
+        out, _ = pad_packed_sequence(out, batch_first=True)
         out = self.hidden2out(out)
         return out
 
@@ -1297,6 +1194,7 @@ class TransformerEncoder(BaseModel):
 
 
 # For backward compatibility
+# Will be removed in v0.1.0
 
 
 def ResF0Conv1dResnet(*args, **kwargs):
